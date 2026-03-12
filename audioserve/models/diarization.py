@@ -72,7 +72,7 @@ class DiarizationRunner:
         t0 = time.monotonic()
 
         # pyannote expects {"waveform": tensor(1, T), "sample_rate": int}
-        waveform_tensor = torch.from_numpy(waveform).unsqueeze(0).float()
+        waveform_tensor = torch.from_numpy(waveform.copy()).unsqueeze(0).float()
         audio_input = {"waveform": waveform_tensor, "sample_rate": sample_rate}
 
         min_sp = min_speakers or self.config.min_speakers

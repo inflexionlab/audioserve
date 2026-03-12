@@ -23,6 +23,7 @@ dependencies = [
     "protobuf>=4.25",
     "pydantic>=2.0",
     "python-multipart>=0.0.9",
+    "transformers>=4.40",
     "soundfile>=0.12",
     "librosa>=0.10",
     "numpy>=1.24",

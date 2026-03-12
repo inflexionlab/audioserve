@@ -64,31 +64,67 @@ def load_audio(source: str | bytes | np.ndarray, sample_rate: int | None = None)
 
 
 def _read_audio(source: str | bytes) -> tuple[np.ndarray, int]:
-    """Read audio from file path or bytes. Handles mp3, wav, flac, ogg, etc."""
+    """Read audio from file path or bytes. Handles mp3, wav, flac, ogg, etc.
+
+    Tries soundfile first (fast, supports wav/flac/ogg).
+    Falls back to ffmpeg subprocess for mp3 and other formats.
+    """
     import soundfile as sf
 
+    buf = io.BytesIO(source) if isinstance(source, bytes) else None
+
     try:
-        if isinstance(source, bytes):
-            waveform, sr = sf.read(io.BytesIO(source), dtype="float32")
+        if buf is not None:
+            waveform, sr = sf.read(buf, dtype="float32")
         else:
             waveform, sr = sf.read(source, dtype="float32")
         return waveform, sr
     except Exception:
-        # soundfile can't handle mp3 and some other formats — fall back to librosa
         pass
 
-    import librosa
+    # Fallback: decode via ffmpeg (handles mp3, aac, wma, opus, etc.)
+    return _read_audio_ffmpeg(source)
+
+
+def _read_audio_ffmpeg(source: str | bytes) -> tuple[np.ndarray, int]:
+    """Decode any audio format to float32 PCM via ffmpeg subprocess."""
+    import subprocess
+    import tempfile
 
     if isinstance(source, bytes):
-        waveform, sr = librosa.load(io.BytesIO(source), sr=None, mono=False)
+        # Write bytes to a temp file — ffmpeg reads from file, outputs to pipe
+        with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as tmp:
+            tmp.write(source)
+            tmp_path = tmp.name
+        input_path = tmp_path
     else:
-        waveform, sr = librosa.load(source, sr=None, mono=False)
+        input_path = source
+        tmp_path = None
 
-    # librosa returns (channels, samples) for multi-channel, transpose to (samples, channels)
-    if waveform.ndim > 1:
-        waveform = waveform.T
+    try:
+        # ffmpeg: decode to 16kHz mono float32 PCM on stdout
+        cmd = [
+            "ffmpeg", "-i", input_path,
+            "-f", "f32le",       # raw float32 little-endian
+            "-acodec", "pcm_f32le",
+            "-ar", "16000",      # resample to 16kHz
+            "-ac", "1",          # mono
+            "-v", "error",       # suppress noisy output
+            "pipe:1",            # output to stdout
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
 
-    return waveform.astype(np.float32), sr
+        if result.returncode != 0:
+            stderr = result.stderr.decode(errors="replace").strip()
+            raise RuntimeError(f"ffmpeg failed to decode audio: {stderr}")
+
+        waveform = np.frombuffer(result.stdout, dtype=np.float32)
+        return waveform, 16000
+
+    finally:
+        if tmp_path:
+            import os
+            os.unlink(tmp_path)
 
 
 def _resample(waveform: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:

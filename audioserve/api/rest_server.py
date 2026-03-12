@@ -6,7 +6,8 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse
 
 from audioserve.api.schemas import (
     DiarizedTranscribeResponse,
@@ -23,6 +24,33 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Valid Whisper language codes
+_VALID_LANGUAGES = {
+    "af", "am", "ar", "as", "az", "ba", "be", "bg", "bn", "bo", "br", "bs", "ca", "cs",
+    "cy", "da", "de", "el", "en", "es", "et", "eu", "fa", "fi", "fo", "fr", "gl", "gu",
+    "ha", "haw", "he", "hi", "hr", "ht", "hu", "hy", "id", "is", "it", "ja", "jw", "ka",
+    "kk", "km", "kn", "ko", "la", "lb", "ln", "lo", "lt", "lv", "mg", "mi", "mk", "ml",
+    "mn", "mr", "ms", "mt", "my", "ne", "nl", "nn", "no", "oc", "pa", "pl", "ps", "pt",
+    "ro", "ru", "sa", "sd", "si", "sk", "sl", "sn", "so", "sq", "sr", "su", "sv", "sw",
+    "ta", "te", "tg", "th", "tk", "tl", "tr", "tt", "uk", "ur", "uz", "vi", "yi", "yo",
+    "yue", "zh",
+}
+
+
+def _sanitize_language(language: str | None) -> str | None:
+    """Validate and sanitize language parameter."""
+    if language is None or language.strip() == "":
+        return None
+    lang = language.strip().lower()
+    if lang == "string" or lang == "null" or lang == "none":
+        return None
+    if lang not in _VALID_LANGUAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid language code '{language}'. Use ISO 639-1 codes like 'en', 'ru', 'de'.",
+        )
+    return lang
+
 
 def create_app(engine: AudioServeEngine) -> FastAPI:
     """Create the FastAPI application with all routes."""
@@ -32,6 +60,14 @@ def create_app(engine: AudioServeEngine) -> FastAPI:
         description="Optimized inference server for audio models",
         version="0.1.0",
     )
+
+    @app.exception_handler(Exception)
+    async def global_exception_handler(request: Request, exc: Exception):
+        logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Internal server error: {type(exc).__name__}: {exc}"},
+        )
 
     @app.get("/health", response_model=HealthResponse)
     async def health():
@@ -68,11 +104,13 @@ def create_app(engine: AudioServeEngine) -> FastAPI:
         if not audio_bytes:
             raise HTTPException(status_code=400, detail="Empty audio file")
 
+        lang = _sanitize_language(language)
+
         try:
             result = await engine.transcribe(
                 audio_bytes,
                 model=model,
-                language=language,
+                language=lang,
                 beam_size=beam_size,
                 word_timestamps=word_timestamps,
             )
@@ -107,11 +145,13 @@ def create_app(engine: AudioServeEngine) -> FastAPI:
                 detail="Diarization not enabled. Start engine with diarization=True.",
             )
 
+        lang = _sanitize_language(language)
+
         try:
             result = await engine.transcribe_with_diarization(
                 audio_bytes,
                 model=model,
-                language=language,
+                language=lang,
                 beam_size=beam_size,
                 word_timestamps=word_timestamps,
                 min_speakers=min_speakers,

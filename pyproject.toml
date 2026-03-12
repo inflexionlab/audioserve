@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "audioserve"
+version = "0.1.0"
+description = "Optimized inference server for audio models — like vLLM, but for ASR"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [{ name = "AudioServe Contributors" }]
+
+dependencies = [
+    "faster-whisper>=1.1.0",
+    "pyannote.audio>=3.3",
+    "torch>=2.1",
+    "torchaudio>=2.1",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "grpcio>=1.60",
+    "grpcio-tools>=1.60",
+    "protobuf>=4.25",
+    "pydantic>=2.0",
+    "python-multipart>=0.0.9",
+    "soundfile>=0.12",
+    "librosa>=0.10",
+    "numpy>=1.24",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+audioserve = "audioserve.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["audioserve*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]

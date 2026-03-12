@@ -1,0 +1,11 @@
+__pycache__
+*.pyc
+*.egg-info
+dist
+build
+.git
+.claude
+*.wav
+*.mp3
+*.flac
+benchmarks/results.json

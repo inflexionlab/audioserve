@@ -7,38 +7,46 @@ Optimized inference server for audio models — like vLLM, but for ASR.
 ## Features
 
 - **Multi-model support** — Whisper (all sizes), Wav2Vec2, HuBERT, distil-whisper
-- **Optimized Whisper inference** — powered by faster-whisper (CTranslate2), up to 25x realtime
+- **Optimized Whisper inference** — powered by faster-whisper (CTranslate2), up to 87x realtime
 - **Speaker diarization** — integrated pyannote.audio pipeline with per-segment speaker labels
 - **Dynamic batching** — sort-by-duration padding minimization, configurable batch scheduler
+- **REST + gRPC APIs** — both protocols, same server
 - **Two endpoints** — pure ASR (`/v1/transcribe`) and ASR+diarization (`/v1/transcribe+diarize`)
 - **Word-level timestamps** — precise timing for every word
 - **Language auto-detection** — 99 languages via Whisper
-- **Python client** — simple API for programmatic access
-- **CLI** — serve models or transcribe files from the command line
+- **Docker ready** — single command deployment
+- **Python client + CLI** — programmatic access or command line
 
 ## Quickstart
 
+### Docker
+
 ```bash
-pip install audioserve
+docker build -t audioserve .
+docker run --gpus all -p 8000:8000 -p 50051:50051 audioserve \
+  serve -m openai/whisper-large-v3
 ```
 
-### Start a server
+### pip
 
 ```bash
+pip install audioserve
 audioserve serve -m openai/whisper-large-v3
 ```
 
-### Or use Python
+### Python
 
 ```python
 from audioserve import AudioServeEngine
 
 engine = AudioServeEngine(model="openai/whisper-large-v3")
 engine.start()
-engine.serve(port=8000)
+engine.serve(port=8000)  # REST on 8000, gRPC on 50051
 ```
 
-### Transcribe via API
+## API
+
+### REST — Transcribe
 
 ```bash
 curl -X POST http://localhost:8000/v1/transcribe \
@@ -46,28 +54,7 @@ curl -X POST http://localhost:8000/v1/transcribe \
   -F "language=en"
 ```
 
-### Python client
-
-```python
-from audioserve import AudioServeClient
-
-client = AudioServeClient("http://localhost:8000")
-result = client.transcribe("meeting.wav", language="en")
-print(result.text)
-print(result.segments)  # with timestamps and word-level detail
-```
-
-### ASR + Speaker Diarization
-
-```python
-engine = AudioServeEngine(
-    model="openai/whisper-large-v3",
-    diarization=True,
-    hf_token="your_token",  # required for pyannote
-)
-engine.start()
-engine.serve()
-```
+### REST — Transcribe + Diarization
 
 ```bash
 curl -X POST http://localhost:8000/v1/transcribe+diarize \
@@ -76,11 +63,44 @@ curl -X POST http://localhost:8000/v1/transcribe+diarize \
   -F "max_speakers=5"
 ```
 
-### CLI transcription (no server needed)
+### gRPC
+
+```python
+import grpc
+from audioserve.proto import audioserve_pb2, audioserve_pb2_grpc
+
+channel = grpc.insecure_channel("localhost:50051")
+stub = audioserve_pb2_grpc.AudioServeStub(channel)
+
+with open("meeting.wav", "rb") as f:
+    response = stub.Transcribe(audioserve_pb2.TranscribeRequest(
+        audio=f.read(),
+        beam_size=5,
+        word_timestamps=True,
+    ))
+print(response.text)
+```
+
+### Python Client
+
+```python
+from audioserve import AudioServeClient
+
+client = AudioServeClient("http://localhost:8000")
+result = client.transcribe("meeting.wav", language="en")
+print(result.text)
+print(result.segments)  # word-level timestamps
+```
+
+### Diarization
 
 ```bash
-audioserve transcribe recording.wav -m openai/whisper-large-v3 -l en
+audioserve serve -m openai/whisper-large-v3 --diarization --hf-token YOUR_TOKEN
 ```
+
+Requires accepting the pyannote model license on HuggingFace:
+- https://huggingface.co/pyannote/speaker-diarization-3.1
+- https://huggingface.co/pyannote/segmentation-3.0
 
 ## Supported Models
 
@@ -92,27 +112,40 @@ audioserve transcribe recording.wav -m openai/whisper-large-v3 -l en
 | facebook/hubert-* | Encoder + CTC | PyTorch + torch.compile | per-finetune |
 | pyannote/speaker-diarization-3.1 | Segmentation + clustering | pyannote.audio | any |
 
-## Benchmarks (RTX A5000, 24GB)
+## Benchmarks
 
-| Model | Avg Latency (3.4s audio) | Realtime Factor |
-|-------|--------------------------|-----------------|
-| whisper-tiny | 134ms | 25x |
-| whisper-base | 142ms | 24x |
-| whisper-small | 195ms | 17x |
+RTX A5000 24GB, CUDA 13.0, 6.5 min audio file:
+
+| Model | Avg Latency | Realtime Factor |
+|-------|-------------|-----------------|
+| openai/whisper-tiny | 4.5s | 87x |
+| openai/whisper-base | 4.7s | 83x |
+| openai/whisper-small | 5.0s | 78x |
+| openai/whisper-medium | 6.9s | 56x |
+| openai/whisper-large-v3 | 9.0s | 43x |
+| openai/whisper-large-v3-turbo | 6.6s | 59x |
+| facebook/wav2vec2-base-960h | 2.9s | 133x |
+
+**Diarization overhead** (whisper-large-v3 + pyannote): +6.6s for speaker identification.
 
 ## Architecture
 
 ```
-Client (REST/gRPC) → Request Queue → Dynamic Batch Scheduler → Model Runner → Response
-                                          ↓
-                               Sort by duration, pad minimally
-                                          ↓
-                              WhisperRunner | Wav2Vec2Runner | PyAnnoteRunner
+Client (REST/gRPC)
+    |
+    v
+Request Queue → Dynamic Batch Scheduler → Model Runner → Response
+                      |
+              Sort by duration,
+              pad minimally
+                      |
+        WhisperRunner | Wav2Vec2Runner | PyAnnoteRunner
+        (CTranslate2)   (torch.compile)   (pyannote.audio)
 ```
 
 ## Roadmap
 
-- **v0.1** (current) — Whisper, Wav2Vec2, diarization, REST API, dynamic batching
+- **v0.1** (current) — Whisper, Wav2Vec2, diarization, REST + gRPC API, dynamic batching, Docker
 - **v0.2** — Streaming ASR (WebSocket), NVIDIA Parakeet support, custom CUDA mel spectrogram kernel
 - **v0.3** — Multi-GPU, INT8 quantization, Prometheus metrics, Kubernetes deployment
 

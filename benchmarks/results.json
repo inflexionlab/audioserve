@@ -1,0 +1,84 @@
+{
+  "models": [
+    {
+      "model": "openai/whisper-tiny",
+      "dtype": "float16",
+      "audio_duration": 388.911,
+      "avg_ms": 4453.561223732929,
+      "min_ms": 4352.688449900597,
+      "rtf": 87.32584564628907,
+      "text_preview": "Well, I want to tell you a story. When I was little, I loved butterflies. And I guess this isn't ver",
+      "language": "en"
+    },
+    {
+      "model": "openai/whisper-base",
+      "dtype": "float16",
+      "audio_duration": 388.911,
+      "avg_ms": 4667.857902590185,
+      "min_ms": 4200.348359066993,
+      "rtf": 83.31680357797396,
+      "text_preview": "Well, I want to tell you a story. When I was little, I loved butterflies. And I guess this isn't ver",
+      "language": "en"
+    },
+    {
+      "model": "openai/whisper-small",
+      "dtype": "float16",
+      "audio_duration": 388.911,
+      "avg_ms": 5018.604996614158,
+      "min_ms": 4391.121306922287,
+      "rtf": 77.49384545354374,
+      "text_preview": "Well, I want to tell you a story. When I was little, I loved butterflies, and I guess this isn't ver",
+      "language": "en"
+    },
+    {
+      "model": "openai/whisper-medium",
+      "dtype": "float16",
+      "audio_duration": 388.911,
+      "avg_ms": 6905.36562136064,
+      "min_ms": 6693.40312294662,
+      "rtf": 56.320117040141405,
+      "text_preview": "Well, I want to tell you a story when I was little I Loved butterflies and I guess this isn't very u",
+      "language": "en"
+    },
+    {
+      "model": "openai/whisper-large-v3",
+      "dtype": "float16",
+      "audio_duration": 388.911,
+      "avg_ms": 9037.12143826609,
+      "min_ms": 8873.458428774029,
+      "rtf": 43.0348316835962,
+      "text_preview": "Well, I want to tell you a story. When I was little, I loved butterflies. And I guess this isn't ver",
+      "language": "en"
+    },
+    {
+      "model": "openai/whisper-large-v3-turbo",
+      "dtype": "float16",
+      "audio_duration": 388.911,
+      "avg_ms": 6625.21567940712,
+      "min_ms": 6291.227390058339,
+      "rtf": 58.701636115611414,
+      "text_preview": "Well, I want to tell you a story. When I was little, I loved butterflies. And I guess this isn't ver",
+      "language": "en"
+    },
+    {
+      "model": "facebook/wav2vec2-base-960h",
+      "dtype": "float32",
+      "audio_duration": 388.911,
+      "avg_ms": 2927.0708087521293,
+      "min_ms": 2322.890239302069,
+      "rtf": 132.86695997825922,
+      "text_preview": "NOWELL I WANT TO TELL YOU A STORY HU WHEN I WAS LITTLE I LOVED BUTTERFLIES AND I GUESS THIS ISN'T VE",
+      "language": null
+    }
+  ],
+  "diarization": {
+    "audio_duration": 388.911,
+    "asr_only_ms": 8273.964401800185,
+    "asr_diarization_ms": 14829.433480277658,
+    "diarization_overhead_ms": 6555.469078477472,
+    "speakers": [
+      "SPEAKER_00"
+    ],
+    "num_segments": 15
+  }
+}

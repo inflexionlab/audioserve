@@ -24,6 +24,7 @@ def main(log_level: str) -> None:
 @click.option("--port", "-p", default=8000, type=int, help="Server port")
 @click.option("--dtype", default="float16", type=click.Choice(["float16", "float32", "int8", "int8_float16"]))
 @click.option("--max-batch-size", default=32, type=int, help="Maximum batch size")
+@click.option("--grpc-port", default=50051, type=int, help="gRPC port (0 to disable)")
 @click.option("--diarization/--no-diarization", default=False, help="Enable speaker diarization")
 @click.option("--hf-token", default=None, help="HuggingFace token (required for pyannote)")
 def serve(
@@ -32,6 +33,7 @@ def serve(
     port: int,
     dtype: str,
     max_batch_size: int,
+    grpc_port: int,
     diarization: bool,
     hf_token: str | None,
 ) -> None:
@@ -46,7 +48,7 @@ def serve(
         hf_token=hf_token,
     )
     engine.start()
-    engine.serve(host=host, port=port)
+    engine.serve(host=host, port=port, grpc_port=grpc_port or None)
 
 
 @main.command()

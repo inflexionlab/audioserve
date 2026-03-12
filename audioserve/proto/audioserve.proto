@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package audioserve.v1;
+
+service AudioServe {
+  // Transcribe audio (ASR only)
+  rpc Transcribe (TranscribeRequest) returns (TranscribeResponse);
+
+  // Transcribe audio with speaker diarization
+  rpc TranscribeWithDiarization (DiarizeRequest) returns (DiarizedTranscribeResponse);
+
+  // List loaded models
+  rpc ListModels (ListModelsRequest) returns (ListModelsResponse);
+
+  // Health check
+  rpc HealthCheck (HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message TranscribeRequest {
+  bytes audio = 1;                   // Raw audio file bytes (wav, mp3, flac, etc.)
+  optional string language = 2;      // Language code (e.g. "en", "ru"). Empty for auto-detect.
+  int32 beam_size = 3;               // Beam search width (default: 5)
+  bool word_timestamps = 4;          // Whether to return word-level timestamps
+  optional string model = 5;         // Model ID to use. Empty for default.
+}
+
+message DiarizeRequest {
+  bytes audio = 1;
+  optional string language = 2;
+  int32 beam_size = 3;
+  bool word_timestamps = 4;
+  optional string model = 5;
+  optional int32 min_speakers = 6;
+  optional int32 max_speakers = 7;
+}
+
+message WordInfo {
+  string word = 1;
+  float start = 2;
+  float end = 3;
+  float confidence = 4;
+}
+
+message Segment {
+  string text = 1;
+  float start = 2;
+  float end = 3;
+  repeated WordInfo words = 4;
+  optional string speaker = 5;
+  float confidence = 6;
+}
+
+message TranscribeResponse {
+  string text = 1;
+  repeated Segment segments = 2;
+  string language = 3;
+  float language_confidence = 4;
+  float duration = 5;               // Audio duration in seconds
+  float processing_time = 6;        // Inference time in seconds
+}
+
+message DiarizedTranscribeResponse {
+  string text = 1;
+  repeated Segment segments = 2;
+  repeated string speakers = 3;
+  string language = 4;
+  float duration = 5;
+  float processing_time = 6;
+}
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  repeated ModelInfo models = 1;
+}
+
+message ModelInfo {
+  string model_id = 1;
+  string backend = 2;
+  bool is_loaded = 3;
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  string status = 1;
+  repeated ModelInfo models = 2;
+  bool diarization_available = 3;
+}

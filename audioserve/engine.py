@@ -201,8 +201,19 @@ class AudioServeEngine:
 
         return result
 
-    def serve(self, host: str = "0.0.0.0", port: int = 8000) -> None:
-        """Start the HTTP/gRPC server (blocking)."""
+    def serve(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 8000,
+        grpc_port: int | None = 50051,
+    ) -> None:
+        """Start the HTTP and gRPC servers (blocking).
+
+        Args:
+            host: Bind address for REST API.
+            port: Port for REST API.
+            grpc_port: Port for gRPC API. None to disable gRPC.
+        """
         import uvicorn
 
         from audioserve.api.rest_server import create_app
@@ -210,8 +221,20 @@ class AudioServeEngine:
         self.config.server.host = host
         self.config.server.port = port
 
-        app = create_app(self)
-        uvicorn.run(app, host=host, port=port, log_level="info")
+        # Start gRPC in background thread
+        grpc_server = None
+        if grpc_port:
+            from audioserve.api.grpc_server import start_grpc_server
+
+            grpc_server = start_grpc_server(self, port=grpc_port)
+            self.config.server.grpc_port = grpc_port
+
+        try:
+            app = create_app(self)
+            uvicorn.run(app, host=host, port=port, log_level="info")
+        finally:
+            if grpc_server:
+                grpc_server.stop(grace=5)
 
     def _get_runner(self, model_id: str | None = None) -> BaseModelRunner:
         """Get a model runner by ID, or the default (first) one."""

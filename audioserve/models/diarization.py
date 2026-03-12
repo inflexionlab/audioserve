@@ -31,9 +31,13 @@ class DiarizationRunner:
         logger.info("Loading diarization pipeline: %s", self.config.model_id)
         t0 = time.monotonic()
 
+        kwargs = {}
+        if self.config.auth_token:
+            kwargs["token"] = self.config.auth_token
+
         self._pipeline = Pipeline.from_pretrained(
             self.config.model_id,
-            use_auth_token=self.config.auth_token,
+            **kwargs,
         )
 
         if torch.cuda.is_available():
@@ -80,10 +84,16 @@ class DiarizationRunner:
         if max_sp is not None:
             kwargs["max_speakers"] = max_sp
 
-        diarization = self._pipeline(audio_input, **kwargs)
+        output = self._pipeline(audio_input, **kwargs)
+
+        # pyannote v4 returns DiarizeOutput dataclass; v3 returns Annotation directly
+        if hasattr(output, "speaker_diarization"):
+            annotation = output.speaker_diarization
+        else:
+            annotation = output
 
         segments = []
-        for turn, _, speaker in diarization.itertracks(yield_label=True):
+        for turn, _, speaker in annotation.itertracks(yield_label=True):
             segments.append(
                 DiarizationSegment(
                     speaker=speaker,

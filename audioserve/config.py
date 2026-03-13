@@ -68,6 +68,17 @@ class SchedulerConfig:
 
 
 @dataclass
+class StreamingConfig:
+    """Configuration for streaming ASR sessions."""
+
+    vad_threshold: float = 0.5  # Silero VAD speech probability threshold
+    min_speech_ms: int = 250  # minimum speech duration to trigger inference
+    min_silence_ms: int = 700  # silence duration to confirm + trim buffer
+    inference_interval_ms: int = 1000  # run Whisper every N ms of new audio
+    max_buffer_seconds: float = 30.0  # max audio buffered per session
+
+
+@dataclass
 class EngineConfig:
     """Top-level engine configuration."""
 
@@ -75,4 +86,5 @@ class EngineConfig:
     diarization: DiarizationConfig | None = None
     server: ServerConfig = field(default_factory=ServerConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    streaming: StreamingConfig = field(default_factory=StreamingConfig)
     gpu_memory_utilization: float = 0.9

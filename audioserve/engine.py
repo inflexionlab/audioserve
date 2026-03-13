@@ -15,6 +15,7 @@ from audioserve.config import (
     ModelConfig,
     SchedulerConfig,
     ServerConfig,
+    StreamingConfig,
     TaskType,
 )
 from audioserve.core.preprocessing import AudioData, load_audio
@@ -24,6 +25,8 @@ from audioserve.models.base import (
     DiarizedTranscriptionResult,
     TranscriptionResult,
 )
+from audioserve.core.streaming import StreamingSession
+from audioserve.core.vad import SileroVAD
 from audioserve.models.diarization import DiarizationRunner
 from audioserve.models.registry import create_runner
 
@@ -85,6 +88,7 @@ class AudioServeEngine:
 
         self._runners: dict[str, BaseModelRunner] = {}
         self._diarization_runner: DiarizationRunner | None = None
+        self._vad: SileroVAD | None = None
         self._scheduler = DynamicBatchScheduler(self.config.scheduler)
         self._batch_workers: list[asyncio.Task] = []
         self._running = False
@@ -141,7 +145,66 @@ class AudioServeEngine:
             self._diarization_runner.unload()
             self._diarization_runner = None
 
+        self._vad = None
+
         logger.info("AudioServe engine stopped")
+
+    def start_vad(self) -> None:
+        """Load the Silero VAD model for streaming support."""
+        if self._vad is None:
+            self._vad = SileroVAD(
+                threshold=self.config.streaming.vad_threshold,
+                min_speech_ms=self.config.streaming.min_speech_ms,
+                min_silence_ms=self.config.streaming.min_silence_ms,
+            )
+        if not self._vad.is_loaded:
+            self._vad.load()
+            logger.info("VAD ready for streaming")
+
+    def create_streaming_session(
+        self,
+        model: str | None = None,
+        language: str | None = None,
+        beam_size: int = 5,
+    ) -> StreamingSession:
+        """Create a new streaming ASR session.
+
+        Args:
+            model: Model ID to use. Defaults to first loaded model.
+            language: Language code. None for auto-detect.
+            beam_size: Beam search width.
+
+        Returns:
+            StreamingSession that the WebSocket handler feeds audio into.
+        """
+        if self._vad is None or not self._vad.is_loaded:
+            raise RuntimeError("VAD not loaded. Call start_vad() first.")
+
+        runner = self._get_runner(model)
+
+        # Each session gets its own VAD instance with fresh state
+        session_vad = SileroVAD(
+            threshold=self.config.streaming.vad_threshold,
+            min_speech_ms=self.config.streaming.min_speech_ms,
+            min_silence_ms=self.config.streaming.min_silence_ms,
+        )
+        session_vad._model = self._vad._model  # Share the model weights
+        session_vad.reset()
+
+        session = StreamingSession(
+            runner=runner,
+            vad=session_vad,
+            language=language,
+            beam_size=beam_size,
+            inference_interval_ms=self.config.streaming.inference_interval_ms,
+            max_buffer_seconds=self.config.streaming.max_buffer_seconds,
+        )
+        return session
+
+    @property
+    def has_streaming(self) -> bool:
+        """True when VAD is loaded and streaming is available."""
+        return self._vad is not None and self._vad.is_loaded
 
     async def transcribe(
         self,

@@ -69,3 +69,4 @@ class HealthResponse(BaseModel):
     status: str
     models: list[ModelInfoResponse] = []
     diarization_available: bool = False
+    streaming_available: bool = False

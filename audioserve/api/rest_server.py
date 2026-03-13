@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from audioserve.api.schemas import (
@@ -60,6 +61,10 @@ def create_app(engine: AudioServeEngine) -> FastAPI:
     async def lifespan(app: FastAPI):
         await engine.start_batch_workers()
         logger.info("Batch workers started")
+        try:
+            engine.start_vad()
+        except Exception as e:
+            logger.warning("VAD loading failed, streaming disabled: %s", e)
         yield
         # Workers are cleaned up by engine.stop()
 
@@ -94,6 +99,7 @@ def create_app(engine: AudioServeEngine) -> FastAPI:
             status=status,
             models=models,
             diarization_available=engine.has_diarization,
+            streaming_available=engine.has_streaming,
         )
 
     @app.post("/v1/transcribe", response_model=TranscribeResponse)
@@ -205,8 +211,110 @@ def create_app(engine: AudioServeEngine) -> FastAPI:
                     "is_loaded": runner.is_loaded,
                 }
                 for model_id, runner in engine._runners.items()
-            ]
+            ],
+            "streaming_available": engine.has_streaming,
         }
+
+    @app.websocket("/v1/stream")
+    async def websocket_stream(websocket: WebSocket):
+        """Streaming ASR via WebSocket.
+
+        Protocol:
+        1. Client connects and sends JSON config:
+           {"model": "openai/whisper-tiny", "language": "en"}
+        2. Client sends binary PCM frames (float32, 16kHz, mono)
+        3. Server sends JSON results as text updates:
+           {"type": "partial", "text": "hello wor"}       (interim, will update)
+           {"type": "final", "text": "hello world"}        (confirmed, won't change)
+        4. Client sends JSON {"type": "end"} to finalize
+        5. Server sends remaining results and {"type": "stream_end"}
+        """
+        await websocket.accept()
+
+        if not engine.has_streaming:
+            await websocket.send_json({"error": "Streaming not available (VAD not loaded)"})
+            await websocket.close(code=1011)
+            return
+
+        # Step 1: Receive config message
+        try:
+            config_msg = await websocket.receive_json()
+        except Exception:
+            await websocket.send_json({"error": "Expected JSON config as first message"})
+            await websocket.close(code=1008)
+            return
+
+        model = config_msg.get("model")
+        language = config_msg.get("language")
+        beam_size = config_msg.get("beam_size", 5)
+
+        if language:
+            language = language.strip().lower()
+            if language in ("", "null", "none", "string"):
+                language = None
+            elif language not in _VALID_LANGUAGES:
+                await websocket.send_json({"error": f"Invalid language: {language}"})
+                await websocket.close(code=1008)
+                return
+
+        try:
+            session = engine.create_streaming_session(
+                model=model, language=language, beam_size=beam_size
+            )
+        except (ValueError, RuntimeError) as e:
+            await websocket.send_json({"error": str(e)})
+            await websocket.close(code=1008)
+            return
+
+        session.start()
+        await websocket.send_json({"type": "session_started", "model": model or engine.loaded_models[0]})
+
+        # Start result consumer task
+        async def send_results():
+            async for result in session.results():
+                try:
+                    await websocket.send_json({
+                        "type": "final" if result.is_final else "partial",
+                        "text": result.text,
+                    })
+                except WebSocketDisconnect:
+                    break
+
+        result_task = asyncio.create_task(send_results())
+
+        # Step 2: Receive audio chunks
+        try:
+            while True:
+                message = await websocket.receive()
+
+                if message.get("type") == "websocket.disconnect":
+                    break
+
+                if "bytes" in message and message["bytes"]:
+                    session.feed_audio(message["bytes"])
+
+                elif "text" in message:
+                    import json
+                    try:
+                        msg = json.loads(message["text"])
+                    except json.JSONDecodeError:
+                        continue
+
+                    if msg.get("type") == "end":
+                        break
+
+        except WebSocketDisconnect:
+            pass
+
+        # Step 3: Finalize
+        await session.end_stream()
+        await result_task
+
+        try:
+            await websocket.send_json({"type": "stream_end"})
+            await websocket.close()
+        except Exception:
+            pass
 
     return app
 

@@ -134,8 +134,9 @@ class AudioServeServicer(audioserve_pb2_grpc.AudioServeServicer):
             )
             for model_id, runner in self.engine._runners.items()
         ]
+        status = "ok" if self.engine.is_ready else "loading"
         return audioserve_pb2.HealthCheckResponse(
-            status="ok",
+            status=status,
             models=models,
             diarization_available=self.engine.has_diarization,
         )

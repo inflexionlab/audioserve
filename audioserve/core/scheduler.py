@@ -58,6 +58,11 @@ class DynamicBatchScheduler:
         self._queues: dict[str, list[InferenceRequest]] = {}  # model_id -> queue
         self._lock = asyncio.Lock()
         self._notify: dict[str, asyncio.Event] = {}
+        self._model_max_batch: dict[str, int] = {}  # per-model override
+
+    def set_model_max_batch_size(self, model_id: str, max_batch_size: int) -> None:
+        """Set a per-model max batch size (overrides global config)."""
+        self._model_max_batch[model_id] = max_batch_size
 
     async def enqueue(self, request: InferenceRequest) -> asyncio.Future:
         """Add a request to the queue. Returns a future for the result."""
@@ -84,6 +89,12 @@ class DynamicBatchScheduler:
 
         return request.future
 
+    def _max_batch_size(self, model_id: str) -> int:
+        """Get the effective max batch size for a model."""
+        if model_id in self._model_max_batch:
+            return min(self._model_max_batch[model_id], self.config.max_batch_size)
+        return self.config.max_batch_size
+
     async def get_batch(self, model_id: str) -> Batch:
         """Wait for and return the next batch for a given model.
 
@@ -91,6 +102,8 @@ class DynamicBatchScheduler:
         - max_batch_size requests are accumulated, or
         - max_wait_time_ms has elapsed since the first request arrived
         """
+        max_bs = self._max_batch_size(model_id)
+
         while True:
             # Wait for at least one request
             if model_id not in self._queues or not self._queues[model_id]:
@@ -105,7 +118,7 @@ class DynamicBatchScheduler:
             while True:
                 async with self._lock:
                     queue = self._queues.get(model_id, [])
-                    if len(queue) >= self.config.max_batch_size:
+                    if len(queue) >= max_bs:
                         break
 
                 remaining = deadline - time.monotonic()
@@ -126,8 +139,8 @@ class DynamicBatchScheduler:
                 if not queue:
                     continue
 
-                batch_requests = queue[: self.config.max_batch_size]
-                self._queues[model_id] = queue[self.config.max_batch_size :]
+                batch_requests = queue[:max_bs]
+                self._queues[model_id] = queue[max_bs:]
 
                 # Sort by duration to minimize padding
                 if self.config.sort_by_duration:

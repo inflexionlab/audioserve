@@ -98,6 +98,9 @@ class AudioServeEngine:
             runner = create_runner(model_config)
             runner.load()
             self._runners[model_config.model_id] = runner
+            self._scheduler.set_model_max_batch_size(
+                model_config.model_id, model_config.max_batch_size
+            )
             logger.info("Model ready: %s", model_config.model_id)
 
         if self.config.diarization:

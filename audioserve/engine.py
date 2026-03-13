@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 class AudioServeEngine:
     """Main engine that manages models, scheduling, and inference.
 
+    Requests are routed through a DynamicBatchScheduler which accumulates
+    concurrent requests, forms optimal batches (sorted by duration), and
+    dispatches them to the model runner's transcribe_batch().
+
     Usage:
         engine = AudioServeEngine(model="openai/whisper-large-v3")
         engine.start()
@@ -84,6 +88,7 @@ class AudioServeEngine:
         self._scheduler = DynamicBatchScheduler(self.config.scheduler)
         self._batch_workers: list[asyncio.Task] = []
         self._running = False
+        self._ready = False
 
     def start(self) -> None:
         """Load all models into GPU memory."""
@@ -101,13 +106,25 @@ class AudioServeEngine:
             logger.info("Diarization pipeline ready")
 
         self._running = True
+        self._ready = True
         logger.info(
             "AudioServe engine started with %d model(s)", len(self._runners)
         )
 
+    async def start_batch_workers(self) -> None:
+        """Start background batch worker loops for each loaded model.
+
+        Must be called from an async context (e.g. FastAPI lifespan).
+        """
+        for model_id in self._runners:
+            task = asyncio.create_task(self._batch_worker_loop(model_id))
+            self._batch_workers.append(task)
+            logger.info("Batch worker started for %s", model_id)
+
     def stop(self) -> None:
         """Unload all models and stop workers."""
         self._running = False
+        self._ready = False
 
         for task in self._batch_workers:
             task.cancel()
@@ -133,6 +150,10 @@ class AudioServeEngine:
     ) -> TranscriptionResult:
         """Transcribe audio using the specified (or default) model.
 
+        When batch workers are running (server mode), enqueues the request
+        into the scheduler for optimal batching. Otherwise falls back to
+        direct single-request inference.
+
         Args:
             audio: File path, bytes, or numpy array.
             model: Model ID to use. Defaults to first loaded model.
@@ -149,7 +170,18 @@ class AudioServeEngine:
             "word_timestamps": word_timestamps,
         }
 
-        # Direct inference (bypass scheduler for single requests)
+        # If batch workers are active, route through scheduler
+        if self._batch_workers:
+            request = InferenceRequest(
+                audio_duration=audio_data.duration,
+                payload=audio_data.waveform,
+                model_id=runner.model_id,
+                params=params,
+            )
+            future = await self._scheduler.enqueue(request)
+            return await future
+
+        # Direct inference for CLI / non-server usage
         results = runner.transcribe_batch(
             [audio_data.waveform],
             [params],
@@ -200,6 +232,34 @@ class AudioServeEngine:
         )
 
         return result
+
+    async def _batch_worker_loop(self, model_id: str) -> None:
+        """Background loop: pull batches from the scheduler and run inference."""
+        runner = self._runners[model_id]
+
+        while self._running:
+            try:
+                batch = await self._scheduler.get_batch(model_id)
+            except asyncio.CancelledError:
+                break
+
+            try:
+                audio_arrays = [r.payload for r in batch.requests]
+                params = [r.params for r in batch.requests]
+
+                results = await asyncio.get_event_loop().run_in_executor(
+                    None, runner.transcribe_batch, audio_arrays, params,
+                )
+
+                for request, result in zip(batch.requests, results):
+                    if request.future and not request.future.done():
+                        request.future.set_result(result)
+
+            except Exception as e:
+                logger.exception("Batch inference failed for %s", model_id)
+                for request in batch.requests:
+                    if request.future and not request.future.done():
+                        request.future.set_exception(e)
 
     def serve(
         self,
@@ -255,6 +315,11 @@ class AudioServeEngine:
     @property
     def loaded_models(self) -> list[str]:
         return list(self._runners.keys())
+
+    @property
+    def is_ready(self) -> bool:
+        """True when all models are loaded and engine is accepting requests."""
+        return self._ready
 
     @property
     def has_diarization(self) -> bool:

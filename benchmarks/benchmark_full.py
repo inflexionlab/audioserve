@@ -79,7 +79,9 @@ async def benchmark_diarization(audio_path, hf_token):
 
 
 async def main():
-    audio_path = "/research/audio.mp3"
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(script_dir)
+    audio_path = os.path.join(repo_root, "audio.mp3")
     hf_token = os.environ.get("HF_TOKEN", "")
 
     print("=" * 70)
@@ -149,9 +151,10 @@ async def main():
         print(f"  Overhead:          {diar['diarization_overhead_ms']:>8.0f}ms")
 
     # Save results
-    with open("/research/benchmarks/results.json", "w") as f:
+    results_path = os.path.join(script_dir, "results.json")
+    with open(results_path, "w") as f:
         json.dump({"models": results, "diarization": diar}, f, indent=2)
-    print("\nResults saved to benchmarks/results.json")
+    print(f"\nResults saved to {results_path}")
 
 
 if __name__ == "__main__":

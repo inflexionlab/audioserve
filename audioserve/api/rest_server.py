@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -55,10 +56,18 @@ def _sanitize_language(language: str | None) -> str | None:
 def create_app(engine: AudioServeEngine) -> FastAPI:
     """Create the FastAPI application with all routes."""
 
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        await engine.start_batch_workers()
+        logger.info("Batch workers started")
+        yield
+        # Workers are cleaned up by engine.stop()
+
     app = FastAPI(
         title="AudioServe",
         description="Optimized inference server for audio models",
         version="0.1.0",
+        lifespan=lifespan,
     )
 
     @app.exception_handler(Exception)
@@ -71,6 +80,7 @@ def create_app(engine: AudioServeEngine) -> FastAPI:
 
     @app.get("/health", response_model=HealthResponse)
     async def health():
+        status = "ok" if engine.is_ready else "loading"
         models = []
         for model_id, runner in engine._runners.items():
             models.append(
@@ -81,7 +91,7 @@ def create_app(engine: AudioServeEngine) -> FastAPI:
                 )
             )
         return HealthResponse(
-            status="ok",
+            status=status,
             models=models,
             diarization_available=engine.has_diarization,
         )

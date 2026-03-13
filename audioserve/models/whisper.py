@@ -107,8 +107,11 @@ class WhisperRunner(BaseModelRunner):
     ) -> list[TranscriptionResult]:
         """Transcribe a batch of audio arrays.
 
-        For faster-whisper, we use BatchedInferencePipeline for true batched inference.
-        Each audio_array should be a numpy float32 array at 16kHz.
+        For a single input, uses BatchedInferencePipeline which internally
+        splits long audio into VAD segments and processes them in batches.
+        For multiple inputs, processes each sequentially through the batched
+        pipeline (faster-whisper doesn't support cross-input batching, but
+        each input benefits from internal VAD-based batching).
         """
         if not self._batched_model:
             raise RuntimeError("Model not loaded. Call load() first.")

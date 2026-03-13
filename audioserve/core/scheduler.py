@@ -68,6 +68,7 @@ class DynamicBatchScheduler:
             model_id = request.model_id
             if model_id not in self._queues:
                 self._queues[model_id] = []
+            if model_id not in self._notify:
                 self._notify[model_id] = asyncio.Event()
 
             self._queues[model_id].append(request)

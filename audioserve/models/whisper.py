@@ -82,6 +82,13 @@ class WhisperRunner(BaseModelRunner):
         )
         self._batched_model = BatchedInferencePipeline(model=self._model)
 
+        # Patch feature extractor with CUDA kernel if available
+        try:
+            from audioserve.cuda.mel_spectrogram import patch_whisper_model
+            patch_whisper_model(self._model)
+        except Exception as e:
+            logger.warning("CUDA mel spectrogram unavailable, using CPU: %s", e)
+
         load_time = time.monotonic() - t0
         logger.info("Whisper model loaded in %.1fs", load_time)
 

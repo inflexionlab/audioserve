@@ -22,6 +22,11 @@ _WAV2VEC2_PATTERNS = [
     "data2vec-audio",
 ]
 
+_PARAKEET_PATTERNS = [
+    "parakeet-ctc",
+    "parakeet_ctc",
+]
+
 
 def create_runner(config: ModelConfig) -> BaseModelRunner:
     """Create the appropriate model runner based on model ID."""
@@ -33,6 +38,12 @@ def create_runner(config: ModelConfig) -> BaseModelRunner:
         logger.info("Resolved %s → WhisperRunner", config.model_id)
         return WhisperRunner(config)
 
+    if any(p.lower() in model_id for p in _PARAKEET_PATTERNS):
+        from audioserve.models.parakeet import ParakeetRunner
+
+        logger.info("Resolved %s → ParakeetRunner", config.model_id)
+        return ParakeetRunner(config)
+
     if any(p.lower() in model_id for p in _WAV2VEC2_PATTERNS):
         from audioserve.models.wav2vec2 import Wav2Vec2Runner
 
@@ -42,5 +53,6 @@ def create_runner(config: ModelConfig) -> BaseModelRunner:
     raise ValueError(
         f"Unknown model architecture for '{config.model_id}'. "
         f"Supported patterns: Whisper (openai/whisper-*, distil-whisper/*), "
-        f"Wav2Vec2/HuBERT (facebook/wav2vec2-*, facebook/hubert-*)"
+        f"Wav2Vec2/HuBERT (facebook/wav2vec2-*, facebook/hubert-*), "
+        f"Parakeet (nvidia/parakeet-ctc-*)"
     )

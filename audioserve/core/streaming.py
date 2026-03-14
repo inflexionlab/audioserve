@@ -109,7 +109,7 @@ class StreamingSession:
             min_new = int(0.3 * _SAMPLE_RATE)  # at least 300ms new audio
             if self._new_samples_since_inference < min_new:
                 # Check if VAD detected end-of-speech — if so, confirm
-                if self._vad._silence_counter >= self._vad.min_silence_samples:
+                if self._vad.silence_counter >= self._vad.min_silence_samples:
                     await self._confirm_and_trim()
                 continue
 
@@ -162,7 +162,7 @@ class StreamingSession:
             ))
 
         # Check if VAD says speech ended — confirm the text
-        if self._vad._silence_counter >= self._vad.min_silence_samples:
+        if self._vad.silence_counter >= self._vad.min_silence_samples:
             await self._confirm_and_trim()
 
     async def _confirm_and_trim(self) -> None:

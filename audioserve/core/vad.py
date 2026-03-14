@@ -84,7 +84,7 @@ class SileroVAD:
             tensor = torch.from_numpy(chunk)
             prob = self._model(tensor, _SAMPLE_RATE).item()
 
-            abs_pos = self._sample_offset + offset + end - offset
+            abs_pos = self._sample_offset + end
 
             if prob >= self.threshold:
                 self._silence_counter = 0
@@ -123,3 +123,17 @@ class SileroVAD:
     @property
     def is_loaded(self) -> bool:
         return self._model is not None
+
+    @property
+    def model(self):
+        """The underlying Silero model (for sharing weights across sessions)."""
+        return self._model
+
+    @model.setter
+    def model(self, value) -> None:
+        self._model = value
+
+    @property
+    def silence_counter(self) -> int:
+        """Current accumulated silence in samples."""
+        return self._silence_counter

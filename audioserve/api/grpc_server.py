@@ -22,7 +22,6 @@ class AudioServeServicer(audioserve_pb2_grpc.AudioServeServicer):
 
     def __init__(self, engine: AudioServeEngine) -> None:
         self.engine = engine
-        self._loop = asyncio.new_event_loop()
 
     def Transcribe(self, request, context):
         """Transcribe audio."""
@@ -31,7 +30,7 @@ class AudioServeServicer(audioserve_pb2_grpc.AudioServeServicer):
             model = request.model if request.HasField("model") else None
             beam_size = request.beam_size or 5
 
-            result = self._loop.run_until_complete(
+            result = asyncio.run(
                 self.engine.transcribe(
                     audio=request.audio,
                     model=model,
@@ -69,7 +68,7 @@ class AudioServeServicer(audioserve_pb2_grpc.AudioServeServicer):
             if max_speakers == 0:
                 max_speakers = None
 
-            result = self._loop.run_until_complete(
+            result = asyncio.run(
                 self.engine.transcribe_with_diarization(
                     audio=request.audio,
                     model=model,

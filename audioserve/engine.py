@@ -188,7 +188,7 @@ class AudioServeEngine:
             min_speech_ms=self.config.streaming.min_speech_ms,
             min_silence_ms=self.config.streaming.min_silence_ms,
         )
-        session_vad._model = self._vad._model  # Share the model weights
+        session_vad.model = self._vad.model  # Share the model weights
         session_vad.reset()
 
         session = StreamingSession(

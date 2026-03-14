@@ -62,8 +62,9 @@ class AudioServeClient:
 
         resp = self._client.post(f"{self.base_url}/v1/transcribe+diarize", files=files, data=data)
         resp.raise_for_status()
-        result = self._parse_response(resp.json())
-        result.speakers = resp.json().get("speakers", [])
+        body = resp.json()
+        result = self._parse_response(body)
+        result.speakers = body.get("speakers", [])
         return result
 
     def health(self) -> dict:
@@ -88,7 +89,7 @@ class AudioServeClient:
     def _prepare_request(self, audio, language, beam_size, word_timestamps, model):
         if isinstance(audio, (str, Path)):
             path = Path(audio)
-            file_obj = open(path, "rb")
+            file_obj = io.BytesIO(path.read_bytes())
             filename = path.name
         elif isinstance(audio, bytes):
             file_obj = io.BytesIO(audio)

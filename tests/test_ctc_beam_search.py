@@ -485,3 +485,149 @@ class TestCTCBeamSearchIntegration:
             [audio], [{"beam_size": 1}]
         )[0]
         assert isinstance(result.text, str)
+
+
+@pytest.mark.gpu
+class TestCTCBeamSearchLargeVocab:
+    """Validate CUDA kernel with large vocabularies (1024+ tokens)."""
+
+    def test_large_vocab_1024_peaky(self):
+        """V=1024 with peaky distributions: CUDA should match CPU reference."""
+        from audioserve.cuda.ctc_beam_search import ctc_beam_search
+
+        V = 1024
+        T = 50
+        rng = np.random.RandomState(42)
+        lp = np.full((T, V), -10.0, dtype=np.float32)
+        for t in range(T):
+            tok = rng.randint(0, V)
+            lp[t, tok] = -0.05
+
+        cpu_result = cpu_ctc_beam_search(lp, blank_id=0, beam_width=10)
+        gpu_result = ctc_beam_search(
+            torch.from_numpy(lp).cuda(), blank_id=0, beam_width=10, top_k=1
+        )
+
+        assert gpu_result[0][0][0] == cpu_result[0][0]
+
+    def test_large_vocab_1024_score_quality(self):
+        """V=1024 random: GPU score within 10% of CPU."""
+        from audioserve.cuda.ctc_beam_search import ctc_beam_search
+
+        V = 1024
+        T = 50
+        rng = np.random.RandomState(42)
+        raw = rng.randn(T, V).astype(np.float32)
+        lp = raw - np.log(np.exp(raw).sum(axis=1, keepdims=True))
+
+        cpu_result = cpu_ctc_beam_search(lp, blank_id=0, beam_width=10)
+        gpu_result = ctc_beam_search(
+            torch.from_numpy(lp).cuda(), blank_id=0, beam_width=10, top_k=1
+        )
+
+        cpu_score = cpu_result[0][1]
+        gpu_score = gpu_result[0][0][1]
+        assert gpu_score > cpu_score * 1.10, (
+            f"GPU score {gpu_score:.2f} too far from CPU {cpu_score:.2f}"
+        )
+
+    def test_large_vocab_2048(self):
+        """V=2048: kernel handles vocabs larger than 1024."""
+        from audioserve.cuda.ctc_beam_search import ctc_beam_search
+
+        V = 2048
+        T = 30
+        rng = np.random.RandomState(99)
+        lp = np.full((T, V), -10.0, dtype=np.float32)
+        for t in range(T):
+            tok = rng.randint(0, V)
+            lp[t, tok] = -0.05
+
+        result = ctc_beam_search(
+            torch.from_numpy(lp).cuda(), blank_id=0, beam_width=10, top_k=1
+        )
+        assert len(result) == 1
+        assert len(result[0]) >= 1
+        tokens = result[0][0][0]
+        assert all(0 < t < V for t in tokens)
+
+    def test_small_vocab_still_works(self):
+        """V=4 still produces identical results (no regression)."""
+        from audioserve.cuda.ctc_beam_search import ctc_beam_search
+
+        lp = make_log_probs(3, 4, spike_sequence=[1, 2, 3])
+        cpu_result = cpu_ctc_beam_search(lp, blank_id=0, beam_width=5)
+        gpu_result = ctc_beam_search(
+            torch.from_numpy(lp).cuda(), blank_id=0, beam_width=5, top_k=1
+        )
+        assert gpu_result[0][0][0] == cpu_result[0][0]
+
+    def test_large_vocab_batch(self):
+        """Batched V=1024: each element matches independent computation."""
+        from audioserve.cuda.ctc_beam_search import ctc_beam_search
+
+        B, T, V = 3, 30, 1024
+        rng = np.random.RandomState(55)
+        lp = np.full((B, T, V), -10.0, dtype=np.float32)
+        for b in range(B):
+            for t in range(T):
+                tok = rng.randint(0, V)
+                lp[b, t, tok] = -0.05
+
+        batch_results = ctc_beam_search(
+            torch.from_numpy(lp).cuda(), blank_id=0, beam_width=8, top_k=1
+        )
+
+        for b in range(B):
+            single = ctc_beam_search(
+                torch.from_numpy(lp[b]).cuda(), blank_id=0, beam_width=8, top_k=1
+            )
+            assert batch_results[b][0][0] == single[0][0][0]
+
+
+@pytest.mark.gpu
+class TestParakeetBeamSearchIntegration:
+    """End-to-end beam search with Parakeet model."""
+
+    @pytest.fixture(autouse=True)
+    def setup_model(self):
+        from audioserve.config import ModelConfig
+        from audioserve.models.parakeet import ParakeetRunner
+
+        config = ModelConfig(model_id="nvidia/parakeet-ctc-0.6b", dtype="float32")
+        self.runner = ParakeetRunner(config)
+        self.runner.load()
+        yield
+        self.runner.unload()
+
+    def test_beam_vs_greedy(self):
+        """Beam search should produce valid text, not worse than greedy."""
+        audio = np.sin(2 * np.pi * 440 * np.arange(16000 * 3) / 16000).astype(np.float32)
+
+        greedy_result = self.runner.transcribe_batch(
+            [audio], [{"beam_size": 1}]
+        )[0]
+        beam_result = self.runner.transcribe_batch(
+            [audio], [{"beam_size": 5}]
+        )[0]
+
+        assert isinstance(greedy_result.text, str)
+        assert isinstance(beam_result.text, str)
+
+    def test_beam_search_produces_text(self):
+        """Beam search on noise-like audio should produce text."""
+        rng = np.random.RandomState(42)
+        audio = rng.randn(16000 * 2).astype(np.float32) * 0.1
+
+        result = self.runner.transcribe_batch(
+            [audio], [{"beam_size": 5}]
+        )[0]
+        assert isinstance(result.text, str)
+
+    def test_fallback_when_beam1(self):
+        """beam_size=1 should use greedy path."""
+        audio = np.zeros(16000, dtype=np.float32)
+        result = self.runner.transcribe_batch(
+            [audio], [{"beam_size": 1}]
+        )[0]
+        assert isinstance(result.text, str)

@@ -8,11 +8,12 @@ Algorithm:
     For each timestep t:
     1. Expand: each beam produces candidates (blank ext, repeat collapse, new tokens).
        Same-prefix candidates use sentinel tokens (-1=blank, -2=collapse).
-    2. Prune: top-K candidates by score.
+    2. Prune: top-K candidates by score (parallel threshold + serial sort).
     3. Materialize: build new beams from selected candidates.
     4. Dedup: merge beams with identical token sequences.
 
 Log-space arithmetic throughout (log_add via log-sum-exp) to avoid underflow.
+Supports arbitrary vocab sizes (tested up to 1024+ BPE tokens for Parakeet).
 
 Usage:
     from audioserve.cuda.ctc_beam_search import ctc_beam_search
@@ -33,7 +34,6 @@ logger = logging.getLogger(__name__)
 
 MAX_BEAM_WIDTH = 16
 MAX_SEQ_LEN = 512
-MAX_VOCAB_SIZE = 64
 
 cuda_source = r"""
 #include <torch/extension.h>
@@ -44,9 +44,7 @@ cuda_source = r"""
 #define LOG_ZERO -1e30f
 #define MAX_BEAM_WIDTH 16
 #define MAX_SEQ_LEN 512
-#define MAX_VOCAB_SIZE 64
-#define MAX_CANDIDATES (MAX_BEAM_WIDTH * (MAX_VOCAB_SIZE + 2))
-#define BLOCK_SIZE 128
+#define BLOCK_SIZE 256
 
 __device__ __forceinline__ float log_add(float a, float b) {
     if (a <= LOG_ZERO) return b;
@@ -65,13 +63,13 @@ __global__ void ctc_beam_search_kernel(
     float*       __restrict__ out_scores,    // (B, K)
     int*         __restrict__ beam_tok_buf,  // (B, MAX_BEAM_WIDTH, MAX_SEQ_LEN)
     int*         __restrict__ new_tok_buf,   // (B, MAX_BEAM_WIDTH, MAX_SEQ_LEN)
-    float*       __restrict__ g_cand_score,  // (B, MAX_CANDIDATES)
+    float*       __restrict__ g_cand_score,  // (B, max_candidates)
     float*       __restrict__ g_cand_pb,
     float*       __restrict__ g_cand_pnb,
     int*         __restrict__ g_cand_parent,
     int*         __restrict__ g_cand_token,
     int blank_id, int beam_width, int top_k,
-    int B, int T, int V
+    int B, int T, int V, int max_candidates
 ) {
     int batch = blockIdx.x;
     if (batch >= B) return;
@@ -87,12 +85,17 @@ __global__ void ctc_beam_search_kernel(
     __shared__ int   s_old_last[MAX_BEAM_WIDTH];
     __shared__ int   s_old_len[MAX_BEAM_WIDTH];
     __shared__ int   s_num_cands;
+    __shared__ float s_threshold;
+    __shared__ int   s_filtered_count;
+
+    // Shared memory for parallel max-reduction (one float per thread)
+    __shared__ float s_reduce[BLOCK_SIZE];
 
     const float* my_lp = log_probs + (long long)batch * T * V;
     int* my_beam = beam_tok_buf + (long long)batch * MAX_BEAM_WIDTH * MAX_SEQ_LEN;
     int* my_new  = new_tok_buf  + (long long)batch * MAX_BEAM_WIDTH * MAX_SEQ_LEN;
 
-    long long coff = (long long)batch * MAX_CANDIDATES;
+    long long coff = (long long)batch * max_candidates;
     float* c_score  = g_cand_score  + coff;
     float* c_pb     = g_cand_pb     + coff;
     float* c_pnb    = g_cand_pnb    + coff;
@@ -100,6 +103,8 @@ __global__ void ctc_beam_search_kernel(
     int*   c_token  = g_cand_token  + coff;
 
     // ---- Initialize ----
+    // Find top (beam_width-1) non-blank tokens at t=0 by score.
+    // For small V this is trivial; for large V we do a selection scan.
     if (tid == 0) {
         s_log_pb[0] = my_lp[blank_id];
         s_log_pnb[0] = LOG_ZERO;
@@ -107,11 +112,34 @@ __global__ void ctc_beam_search_kernel(
         s_length[0] = 0;
         s_num_beams = 1;
 
-        int nb = 1;
-        for (int v = 0; v < V && nb < beam_width; v++) {
+        int want = min(beam_width - 1, V - 1);  // exclude blank
+        // Selection: pick top `want` tokens by lp score
+        // Use the candidate arrays as scratch for (token, score) pairs
+        int nc = 0;
+        for (int v = 0; v < V; v++) {
             if (v == blank_id) continue;
+            c_score[nc] = my_lp[v];
+            c_token[nc] = v;
+            nc++;
+        }
+        // Partial selection sort for top `want` entries
+        for (int i = 0; i < want && i < nc; i++) {
+            int best = i;
+            float bs = c_score[i];
+            for (int j = i + 1; j < nc; j++) {
+                if (c_score[j] > bs) { best = j; bs = c_score[j]; }
+            }
+            if (best != i) {
+                float tmp = c_score[i]; c_score[i] = c_score[best]; c_score[best] = tmp;
+                int itmp = c_token[i]; c_token[i] = c_token[best]; c_token[best] = itmp;
+            }
+        }
+        // Materialize initial beams from top tokens
+        int nb = 1;
+        for (int i = 0; i < want; i++) {
+            int v = c_token[i];
             s_log_pb[nb] = LOG_ZERO;
-            s_log_pnb[nb] = my_lp[v];
+            s_log_pnb[nb] = c_score[i];
             s_last_token[nb] = v;
             s_length[nb] = 1;
             my_beam[nb * MAX_SEQ_LEN] = v;
@@ -137,12 +165,7 @@ __global__ void ctc_beam_search_kernel(
         int num_beams = s_num_beams;
 
         // PHASE 1: Expand — generate all candidates
-        // For each beam, produce:
-        //   - blank extension (token=-1): same prefix, blank prob
-        //   - repeat collapse (token=-2): same prefix if last_token matches, non-blank prob
-        //   - new token (token>=0, token!=blank, token!=last): new prefix
-        //   - repeat via blank (token>=0, token==last): new prefix (distinct repeat)
-        int total_work = num_beams * (V + 2);  // V tokens + blank + collapse
+        int total_work = num_beams * (V + 2);
         for (int w = tid; w < total_work; w += BLOCK_SIZE) {
             int bi = w / (V + 2);
             int vi = w % (V + 2);
@@ -156,7 +179,7 @@ __global__ void ctc_beam_search_kernel(
                 // Blank extension
                 float npb = old_total + lp_t[blank_id];
                 int idx = atomicAdd(&s_num_cands, 1);
-                if (idx < MAX_CANDIDATES) {
+                if (idx < max_candidates) {
                     c_score[idx] = npb; c_pb[idx] = npb; c_pnb[idx] = LOG_ZERO;
                     c_parent[idx] = bi; c_token[idx] = -1;
                 }
@@ -165,7 +188,7 @@ __global__ void ctc_beam_search_kernel(
                 if (old_last >= 0 && old_last != blank_id) {
                     float npnb = old_pnb + lp_t[old_last];
                     int idx = atomicAdd(&s_num_cands, 1);
-                    if (idx < MAX_CANDIDATES) {
+                    if (idx < max_candidates) {
                         c_score[idx] = npnb; c_pb[idx] = LOG_ZERO; c_pnb[idx] = npnb;
                         c_parent[idx] = bi; c_token[idx] = -2;
                     }
@@ -178,7 +201,7 @@ __global__ void ctc_beam_search_kernel(
                     // Repeat via blank path -> distinct repeat (new prefix)
                     float npnb = old_pb + lp_t[token];
                     int idx = atomicAdd(&s_num_cands, 1);
-                    if (idx < MAX_CANDIDATES) {
+                    if (idx < max_candidates) {
                         c_score[idx] = npnb; c_pb[idx] = LOG_ZERO; c_pnb[idx] = npnb;
                         c_parent[idx] = bi; c_token[idx] = token;
                     }
@@ -186,7 +209,7 @@ __global__ void ctc_beam_search_kernel(
                     // Different token -> new prefix
                     float npnb = old_total + lp_t[token];
                     int idx = atomicAdd(&s_num_cands, 1);
-                    if (idx < MAX_CANDIDATES) {
+                    if (idx < max_candidates) {
                         c_score[idx] = npnb; c_pb[idx] = LOG_ZERO; c_pnb[idx] = npnb;
                         c_parent[idx] = bi; c_token[idx] = token;
                     }
@@ -195,31 +218,159 @@ __global__ void ctc_beam_search_kernel(
         }
         __syncthreads();
 
-        // PHASE 2: Top-K selection (serial, thread 0)
-        if (tid == 0) {
-            int nc = min(s_num_cands, (int)MAX_CANDIDATES);
-            int select = min(beam_width * 3, nc);  // keep extra for dedup merging
+        // PHASE 2: Top-K selection
+        // For small candidate counts (<=256), use serial selection sort.
+        // For large counts, use parallel threshold filtering then serial sort.
+        int nc = min(s_num_cands, max_candidates);
+        int select = min(beam_width * 3, nc);
 
-            for (int i = 0; i < select; i++) {
-                int best = i;
-                float bs = c_score[i];
-                for (int j = i + 1; j < nc; j++) {
-                    if (c_score[j] > bs) { best = j; bs = c_score[j]; }
+        if (nc <= 256) {
+            // Small candidate set: serial selection sort on thread 0
+            if (tid == 0) {
+                for (int i = 0; i < select; i++) {
+                    int best = i;
+                    float bs = c_score[i];
+                    for (int j = i + 1; j < nc; j++) {
+                        if (c_score[j] > bs) { best = j; bs = c_score[j]; }
+                    }
+                    if (best != i) {
+                        float tmp; int itmp;
+                        #define SWAP_F(a,b) tmp=a; a=b; b=tmp
+                        #define SWAP_I(a,b) itmp=a; a=b; b=itmp
+                        SWAP_F(c_score[i], c_score[best]);
+                        SWAP_F(c_pb[i], c_pb[best]);
+                        SWAP_F(c_pnb[i], c_pnb[best]);
+                        SWAP_I(c_parent[i], c_parent[best]);
+                        SWAP_I(c_token[i], c_token[best]);
+                        #undef SWAP_F
+                        #undef SWAP_I
+                    }
                 }
-                if (best != i) {
-                    float tmp; int itmp;
-                    #define SWAP_F(a,b) tmp=a; a=b; b=tmp
-                    #define SWAP_I(a,b) itmp=a; a=b; b=itmp
-                    SWAP_F(c_score[i], c_score[best]);
-                    SWAP_F(c_pb[i], c_pb[best]);
-                    SWAP_F(c_pnb[i], c_pnb[best]);
-                    SWAP_I(c_parent[i], c_parent[best]);
-                    SWAP_I(c_token[i], c_token[best]);
-                    #undef SWAP_F
-                    #undef SWAP_I
-                }
+                s_num_cands = select;
             }
-            s_num_cands = select;
+        } else {
+            // Large candidate set: parallel threshold reduction + compact + serial sort
+            // Step 1: Find approximate K-th largest score via parallel reduction.
+            // Each thread finds top-1 from its strided slice, then we find K-th
+            // from the block-wide top values. This gives a conservative threshold.
+
+            // Actually: find K-th largest using iterative threshold.
+            // First pass: find global max via parallel reduction.
+            float local_max = LOG_ZERO;
+            for (int i = tid; i < nc; i += BLOCK_SIZE) {
+                if (c_score[i] > local_max) local_max = c_score[i];
+            }
+            s_reduce[tid] = local_max;
+            __syncthreads();
+
+            // Parallel reduction for max
+            for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+                if (tid < stride) {
+                    if (s_reduce[tid + stride] > s_reduce[tid])
+                        s_reduce[tid] = s_reduce[tid + stride];
+                }
+                __syncthreads();
+            }
+
+            // Now find a threshold: we need the top `select` candidates.
+            // Use the global max and scan down. For each candidate, each thread
+            // counts how many scores are >= threshold in its slice.
+            // Binary-ish search to find threshold that keeps ~select candidates.
+            if (tid == 0) {
+                float global_max = s_reduce[0];
+                // Start threshold high (global_max) and lower until we have enough.
+                // Use a simple approach: try threshold = global_max - delta for
+                // increasing delta. This is fast because scores are log-probs
+                // and the top candidates cluster near the max.
+                s_threshold = global_max;
+            }
+            __syncthreads();
+
+            // Count candidates above threshold — parallel count
+            float thresh = s_threshold;
+            int target = select;
+
+            // Try a few threshold steps to find one that keeps roughly `select` candidates
+            for (int step = 0; step < 20; step++) {
+                int local_count = 0;
+                for (int i = tid; i < nc; i += BLOCK_SIZE) {
+                    if (c_score[i] >= thresh) local_count++;
+                }
+                // Reduce counts
+                s_reduce[tid] = (float)local_count;
+                __syncthreads();
+                for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+                    if (tid < stride)
+                        s_reduce[tid] += s_reduce[tid + stride];
+                    __syncthreads();
+                }
+
+                int total_above = (int)s_reduce[0];
+                if (total_above >= target) {
+                    // Good enough — use this threshold
+                    break;
+                }
+                // Lower threshold
+                if (tid == 0) {
+                    // Widen by 2.0 in log-space each step
+                    thresh -= 2.0f;
+                    s_threshold = thresh;
+                }
+                __syncthreads();
+                thresh = s_threshold;
+            }
+
+            // Step 2: Compact — filter candidates above threshold into front of array
+            // Thread 0 does the compaction (candidates are in global memory anyway)
+            if (tid == 0) {
+                s_filtered_count = 0;
+            }
+            __syncthreads();
+
+            // Parallel compact: each thread processes its slice and atomically
+            // writes filtered candidates to front of a temporary region.
+            // We reuse the same arrays by first counting, then doing a serial compact.
+            if (tid == 0) {
+                int w = 0;
+                float thr = s_threshold;
+                for (int i = 0; i < nc; i++) {
+                    if (c_score[i] >= thr) {
+                        if (w != i) {
+                            c_score[w] = c_score[i];
+                            c_pb[w] = c_pb[i];
+                            c_pnb[w] = c_pnb[i];
+                            c_parent[w] = c_parent[i];
+                            c_token[w] = c_token[i];
+                        }
+                        w++;
+                    }
+                }
+                s_filtered_count = w;
+
+                // Step 3: Serial selection sort on the filtered (much smaller) set
+                int fnc = w;
+                int fselect = min(select, fnc);
+                for (int i = 0; i < fselect; i++) {
+                    int best = i;
+                    float bs = c_score[i];
+                    for (int j = i + 1; j < fnc; j++) {
+                        if (c_score[j] > bs) { best = j; bs = c_score[j]; }
+                    }
+                    if (best != i) {
+                        float tmp; int itmp;
+                        #define SWAP_F2(a,b) tmp=a; a=b; b=tmp
+                        #define SWAP_I2(a,b) itmp=a; a=b; b=itmp
+                        SWAP_F2(c_score[i], c_score[best]);
+                        SWAP_F2(c_pb[i], c_pb[best]);
+                        SWAP_F2(c_pnb[i], c_pnb[best]);
+                        SWAP_I2(c_parent[i], c_parent[best]);
+                        SWAP_I2(c_token[i], c_token[best]);
+                        #undef SWAP_F2
+                        #undef SWAP_I2
+                    }
+                }
+                s_num_cands = fselect;
+            }
         }
         __syncthreads();
 
@@ -360,7 +511,8 @@ std::vector<torch::Tensor> ctc_beam_search(
 
     auto lp = log_probs.contiguous();
     int B = lp.size(0), T = lp.size(1), V = lp.size(2);
-    TORCH_CHECK(V <= MAX_VOCAB_SIZE, "vocab_size exceeds MAX_VOCAB_SIZE");
+
+    int max_candidates = beam_width * (V + 2);
 
     auto opts = torch::TensorOptions().device(log_probs.device());
     auto out_tokens  = torch::zeros({B, top_k, MAX_SEQ_LEN}, opts.dtype(torch::kInt32));
@@ -369,7 +521,7 @@ std::vector<torch::Tensor> ctc_beam_search(
     auto beam_buf = torch::zeros({B, MAX_BEAM_WIDTH, MAX_SEQ_LEN}, opts.dtype(torch::kInt32));
     auto new_buf  = torch::zeros({B, MAX_BEAM_WIDTH, MAX_SEQ_LEN}, opts.dtype(torch::kInt32));
 
-    long long cs = (long long)B * MAX_CANDIDATES;
+    long long cs = (long long)B * max_candidates;
     auto gs  = torch::empty({cs}, opts.dtype(torch::kFloat32));
     auto gpb = torch::empty({cs}, opts.dtype(torch::kFloat32));
     auto gpnb= torch::empty({cs}, opts.dtype(torch::kFloat32));
@@ -382,7 +534,7 @@ std::vector<torch::Tensor> ctc_beam_search(
         beam_buf.data_ptr<int>(), new_buf.data_ptr<int>(),
         gs.data_ptr<float>(), gpb.data_ptr<float>(), gpnb.data_ptr<float>(),
         gp.data_ptr<int>(), gt.data_ptr<int>(),
-        blank_id, beam_width, top_k, B, T, V
+        blank_id, beam_width, top_k, B, T, V, max_candidates
     );
 
     cudaError_t err = cudaGetLastError();
@@ -430,8 +582,9 @@ def ctc_beam_search(
 
     Args:
         log_probs: (T, V) or (B, T, V) float32 log-probabilities on CUDA.
+                   No vocab size limit — works with small (32) or large (1024+) vocabs.
         blank_id: Index of the CTC blank token.
-        beam_width: Number of beams to maintain at each timestep.
+        beam_width: Number of beams to maintain at each timestep (max 16).
         top_k: Number of top hypotheses to return per batch element.
 
     Returns:
@@ -477,7 +630,7 @@ def ctc_beam_search_decode(
 ) -> str:
     """Beam search + decode to text string.
 
-    Drop-in replacement for greedy argmax decoding in Wav2Vec2Runner.
+    Drop-in replacement for greedy argmax decoding in Wav2Vec2Runner/ParakeetRunner.
     """
     results = ctc_beam_search(log_probs, blank_id, beam_width, top_k=1)
     if not results or not results[0]:

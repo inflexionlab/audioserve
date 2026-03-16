@@ -50,6 +50,8 @@ class ParakeetRunner(BaseModelRunner):
         self._model = None
         self._processor = None
         self._device = None
+        self._beam_search_available = False
+        self._blank_id = 0
 
     def load(self) -> None:
         from transformers import AutoModelForCTC, AutoProcessor
@@ -77,6 +79,17 @@ class ParakeetRunner(BaseModelRunner):
         except Exception as e:
             logger.warning("torch.compile failed, falling back to eager mode: %s", e)
 
+        # Try to compile CUDA CTC beam search kernel
+        try:
+            from audioserve.cuda.ctc_beam_search import _get_module
+            _get_module()
+            self._beam_search_available = True
+            self._blank_id = self._processor.tokenizer.pad_token_id or 0
+            logger.info("CUDA CTC beam search kernel ready (blank_id=%d)", self._blank_id)
+        except Exception as e:
+            logger.warning("CUDA CTC beam search unavailable, using greedy: %s", e)
+            self._beam_search_available = False
+
         load_time = time.monotonic() - t0
         logger.info("Parakeet model loaded in %.1fs", load_time)
 
@@ -102,11 +115,14 @@ class ParakeetRunner(BaseModelRunner):
 
         results = []
         for audio, p in zip(audio_arrays, params):
-            result = self._transcribe_single(audio)
+            beam_width = p.get("beam_size", 1) if p else 1
+            result = self._transcribe_single(audio, beam_width=beam_width)
             results.append(result)
         return results
 
-    def _transcribe_single(self, audio: np.ndarray) -> TranscriptionResult:
+    def _transcribe_single(
+        self, audio: np.ndarray, beam_width: int = 1
+    ) -> TranscriptionResult:
         t0 = time.monotonic()
         duration = len(audio) / 16000.0
         chunk_samples = MAX_CHUNK_SECONDS * 16000
@@ -114,7 +130,7 @@ class ParakeetRunner(BaseModelRunner):
         step = chunk_samples - overlap_samples
 
         if len(audio) <= chunk_samples:
-            text = self._infer_chunk(audio)
+            text = self._infer_chunk(audio, beam_width=beam_width)
             processing_time = time.monotonic() - t0
             segments = [Segment(text=text, start=0.0, end=duration)] if text else []
             return TranscriptionResult(
@@ -134,7 +150,7 @@ class ParakeetRunner(BaseModelRunner):
         while offset < len(audio):
             end = min(offset + chunk_samples, len(audio))
             chunk = audio[offset:end]
-            chunk_text = self._infer_chunk(chunk)
+            chunk_text = self._infer_chunk(chunk, beam_width=beam_width)
             if chunk_text:
                 segments.append(Segment(
                     text=chunk_text,
@@ -160,7 +176,7 @@ class ParakeetRunner(BaseModelRunner):
             processing_time=processing_time,
         )
 
-    def _infer_chunk(self, audio: np.ndarray) -> str:
+    def _infer_chunk(self, audio: np.ndarray, beam_width: int = 1) -> str:
         inputs = self._processor(
             audio,
             sampling_rate=16000,
@@ -172,8 +188,20 @@ class ParakeetRunner(BaseModelRunner):
             with torch.autocast(device_type="cuda", enabled=self.config.dtype == "float16"):
                 logits = self._model(**inputs).logits
 
-        predicted_ids = torch.argmax(logits, dim=-1)
-        text = self._processor.batch_decode(predicted_ids)[0]
+        if beam_width > 1 and self._beam_search_available:
+            from audioserve.cuda.ctc_beam_search import ctc_beam_search_decode
+
+            log_probs = torch.log_softmax(logits.float(), dim=-1).squeeze(0)
+            text = ctc_beam_search_decode(
+                log_probs,
+                self._processor,
+                blank_id=self._blank_id,
+                beam_width=beam_width,
+            )
+        else:
+            predicted_ids = torch.argmax(logits, dim=-1)
+            text = self._processor.batch_decode(predicted_ids)[0]
+
         return text.strip()
 
     def _merge_overlapping_segments(self, segments: list[Segment]) -> list[Segment]:
